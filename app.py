@@ -147,13 +147,103 @@ def get_strikes(price, step=50):
     return atm, call_strikes, put_strikes
 
 def fetch_option_chain(expiry):
+    smart = st.session_state.smart_api
+    
+    # Method 1: optionGreek API
     try:
-        data = st.session_state.smart_api.optionGreek({"name":"NIFTY","expirydate":expiry})
-        if data and data.get("status"):
-            return data.get("data", [])
+        data = smart.optionGreek({"name":"NIFTY","expirydate":expiry})
+        if data and data.get("status") and data.get("data"):
+            logger.info(f"OC via optionGreek: {len(data['data'])} rows")
+            return data["data"]
     except Exception as e:
-        logger.error(f"OC error: {e}")
+        logger.warning(f"optionGreek failed: {e}")
+
+    # Method 2: searchScrip based live feed via getMarketData
+    try:
+        import requests, json
+        headers = {
+            "Authorization": f"Bearer {smart.auth_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-UserType": "USER",
+            "X-SourceID": "WEB",
+            "X-ClientLocalIP": "127.0.0.1",
+            "X-ClientPublicIP": "127.0.0.1",
+            "X-MACAddress": "00:00:00:00:00:00",
+            "X-PrivateKey": st.secrets["ANGEL_API_KEY"],
+        }
+        # Get all NFO NIFTY option tokens for expiry
+        url = "https://apiconnect.angelone.in/rest/secure/angelbroking/marketData/v1/optionChain"
+        payload = {"name": "NIFTY", "expirydate": expiry}
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code == 200:
+            rdata = resp.json()
+            if rdata.get("status") and rdata.get("data"):
+                logger.info(f"OC via REST: {len(rdata['data'])} rows")
+                return rdata["data"]
+    except Exception as e:
+        logger.warning(f"REST OC failed: {e}")
+
+    # Method 3: Build option chain manually from individual LTP calls
+    try:
+        logger.info("Building OC manually via LTP...")
+        return _build_manual_oc(expiry)
+    except Exception as e:
+        logger.error(f"Manual OC failed: {e}")
+
     return []
+
+
+def _build_manual_oc(expiry):
+    """Build option chain manually using searchScrip + LTP for each strike"""
+    smart = st.session_state.smart_api
+    price = st.session_state.current_price
+    if not price:
+        return []
+
+    atm = get_atm(price)
+    # Generate strikes: ATM ± 10 strikes
+    step = 50
+    strikes = [atm + step*i for i in range(-10, 11)]
+
+    # Convert expiry format: "30-JUN-2026" -> "30Jun2026"
+    try:
+        exp_dt = datetime.strptime(expiry, "%d-%b-%Y")
+        exp_str = exp_dt.strftime("%d%b%Y").upper()  # "30JUN2026"
+        exp_str2 = exp_dt.strftime("%-d %b %Y").upper()  # "30 JUN 2026"
+    except:
+        exp_str = expiry.replace("-","")
+
+    rows = []
+    for strike in strikes:
+        row = {"strikePrice": strike, "callOI": 0, "putOI": 0,
+               "callChgOI": 0, "putChgOI": 0, "callLTP": 0, "putLTP": 0}
+        for opt_type in ["CE","PE"]:
+            try:
+                # Search for this option scrip
+                search = smart.searchScrip("NFO", f"NIFTY{exp_str}{strike}{opt_type}")
+                if search and search.get("data"):
+                    token = search["data"][0]["symboltoken"]
+                    ltp_data = smart.ltpData("NFO", f"NIFTY{exp_str}{strike}{opt_type}", token)
+                    if ltp_data and ltp_data.get("status"):
+                        d = ltp_data["data"]
+                        ltp = float(d.get("ltp", 0))
+                        oi  = int(float(d.get("opentInterest", 0)))
+                        prev_oi = int(float(d.get("previousClose", 0)))
+                        if opt_type == "CE":
+                            row["callLTP"] = ltp
+                            row["callOI"]  = oi
+                            row["callChgOI"] = oi - prev_oi
+                        else:
+                            row["putLTP"] = ltp
+                            row["putOI"]  = oi
+                            row["putChgOI"] = oi - prev_oi
+            except:
+                pass
+        rows.append(row)
+
+    logger.info(f"Manual OC built: {len(rows)} strikes")
+    return rows
 
 def parse_pcr(chain_data, call_strikes, put_strikes, atm):
     if not chain_data:
@@ -428,8 +518,8 @@ with m5:
 st.markdown("---")
 if pcr_data:
     comb = round((pcr_data["oi_pcr"] + pcr_data["chg_pcr"]) / 2, 3)
-    st, sc = pcr_signal(comb)
-    st.markdown(f'<div class="signal-box signal-{sc}">📡 &nbsp; COMBINED PCR SIGNAL: {st} &nbsp;|&nbsp; Avg PCR: {comb:.3f}</div>', unsafe_allow_html=True)
+    sig_txt, sig_cls = pcr_signal(comb)
+    st.markdown(f'<div class="signal-box signal-{sig_cls}">📡 &nbsp; COMBINED PCR SIGNAL: {sig_txt} &nbsp;|&nbsp; Avg PCR: {comb:.3f}</div>', unsafe_allow_html=True)
 
 # ─── STRIKES ─────────────────────────────────────────────────────────────────
 if nifty_price and atm:
